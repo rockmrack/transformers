@@ -1435,7 +1435,7 @@ def build(config_class, models_to_create, output_dir):
 
     if len(result["processor"]) == 0:
         # TODO: Some models use NO processor (and no processor files exist on their hub repos.)
-        if config_class.__name__ not in ["PatchTSMixerConfig", "PatchTSTConfig", "TimesFmConfig", "TimmBackboneConfig", "TimmWrapperConfig", "VitDetConfig", "AutoformerConfig"]:
+        if config_class.__name__ not in ["PatchTSMixerConfig", "PatchTSTConfig", "TimesFmConfig", "TimmBackboneConfig", "TimmWrapperConfig", "VitDetConfig", "AutoformerConfig", "TimesFm2_5Config"]:
             # breakpoint()
             error = f"No processor could be built for {config_class.__name__}."
             fill_result_with_error(result, error, None, models_to_create)
