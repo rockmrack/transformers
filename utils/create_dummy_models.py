@@ -507,6 +507,14 @@ def _get_exact_config(_config, config_class):
     config_dict = _config.to_dict() if not isinstance(_config, dict) else _config
 
     keys = [x for x in config_dict.keys() if x.endswith("_config") or x in ["encoder", "decoder"]]
+
+    # TODO: For `VibeVoiceAcousticTokenizer`, it doesn't have `encoder_config` or `decoder_config` when converted to dict
+    # but it has this properties.
+    if not isinstance(_config, dict):
+        for attr in dir(_config):
+            if attr.endswith("_config") or attr in ["encoder", "decoder"]:
+                keys.append(attr)
+
     for key in keys:
         sub_config = getattr(_config, key) if not isinstance(_config, dict) else _config[key]
         if sub_config is not None:
@@ -1561,7 +1569,7 @@ def build(config_class, models_to_create, output_dir):
                 del result["pytorch"][pytorch_arch.__name__]
                 continue
 
-            # breakpoint()
+            breakpoint()
             model = build_model(pytorch_arch, used_tiny_config, output_dir=output_dir)
         except Exception as e:
 
