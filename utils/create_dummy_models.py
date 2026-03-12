@@ -220,6 +220,14 @@ def get_processor_types_from_config_class(config_class, allowed_mappings=None):
     # Add what ever auto types
     processor_types += (AutoTokenizer, AutoImageProcessor, AutoFeatureExtractor, AutoVideoProcessor)
 
+    # TODO: Make this better and clean
+    # The repository `microsoft/VibeVoice-1.5B` has `model_type="vibevoice"` which doesn't exist, and the `preprocessor_config.json`
+    # contains `VibeVoiceTokenizerProcessor` and `VibeVoiceProcessor` also don't exist.
+    # The feature extractor auto mapping only has entries for `vibevoice_acoustic_tokenizer` but not for encoder/decoder config.
+    if config_class.__name__ in ["VibeVoiceAcousticTokenizerEncoderConfig", "VibeVoiceAcousticTokenizerDecoderConfig"]:
+        from transformers import VibeVoiceAcousticTokenizerFeatureExtractor
+        processor_types = (VibeVoiceAcousticTokenizerFeatureExtractor,) + processor_types
+
     return processor_types
 
 
