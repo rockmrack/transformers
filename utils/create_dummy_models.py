@@ -1077,6 +1077,9 @@ def build_model(model_arch, tiny_config, output_dir):
     # breakpoint()
     checkpoint_dir = get_checkpoint_dir(output_dir, model_arch)
 
+    if not os.path.isdir(checkpoint_dir):
+        os.makedirs(checkpoint_dir, exist_ok=True)
+
     processor_output_dir = os.path.join(output_dir, "processors")
     # copy the (same set of) processors (for a model type) to the model arch. specific folder
     if os.path.isdir(processor_output_dir):
