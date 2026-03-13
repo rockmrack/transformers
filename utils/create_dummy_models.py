@@ -1093,7 +1093,7 @@ def build_model(model_arch, tiny_config, output_dir):
     # breakpoint()
 
     with tempfile.TemporaryDirectory(dir=checkpoint_dir) as tmpdir:
-        checkpoint_dir_tmp = checkpoint_dir
+        checkpoint_dir_tmp = tmpdir
         model.save_pretrained(checkpoint_dir_tmp)
 
         # can't call from_pretrained from saved one
