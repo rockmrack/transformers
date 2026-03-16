@@ -1373,10 +1373,12 @@ def get_config_overrides(config_class, processors):
     if config_class.__name__ == "FSMTConfig":
         config_overrides["src_vocab_size"] = tokenizer.src_vocab_size
         config_overrides["tgt_vocab_size"] = tokenizer.tgt_vocab_size
-        # `FSMTConfig` has `DecoderConfig` as `decoder` attribute.
-        config_overrides["decoder"] = configuration_fsmt.DecoderConfig(
-            vocab_size=tokenizer.tgt_vocab_size, bos_token_id=config_overrides["eos_token_id"]
-        )
+
+        # TODO: removed by raushan in #41250
+        # # `FSMTConfig` has `DecoderConfig` as `decoder` attribute.
+        # config_overrides["decoder"] = configuration_fsmt.DecoderConfig(
+        #     vocab_size=tokenizer.tgt_vocab_size, bos_token_id=config_overrides["eos_token_id"]
+        # )
 
     # Marian failed to convert the tokenzier, and has `'vocab_size': 58101` and `'pad_token_id': 58100`.
     # which gives `Padding_idx must be within num_embeddings`
