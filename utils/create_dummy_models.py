@@ -343,6 +343,8 @@ def build_processor(config_class, processor_class, allow_no_checkpoint=False):
             revision = "refs/pr/1"
         elif config_class.__name__ in ['Ernie4_5_VL_MoeConfig', 'Ernie4_5_VLMoeConfig']:
             revision = "refs/pr/10"
+        elif config_class.__name__ in ['Phi4MultimodalConfig']:
+            revision = "refs/pr/70"
 
         sub_folder = ""
         if config_class.__name__ in ['GlmImageTextConfig', 'GlmImageVisionConfig', 'GlmImageVQVAEConfig']:
