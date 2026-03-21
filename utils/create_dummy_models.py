@@ -159,6 +159,7 @@ no_model_tester_at_all = {
     "Sam3TrackerVideoConfig",
     "Sam3VideoConfig",
     "ShieldGemma2Config",
+    "PPChart2TableConfig",
 }
 
 deprecated_models = {
