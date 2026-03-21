@@ -186,7 +186,9 @@ def get_processor_types_from_config_class(config_class, allowed_mappings=None):
 
     # To make a uniform return type
     def _to_tuple(x):
-        if not isinstance(x, collections.abc.Sequence):
+        if isinstance(x, dict):
+           x = tuple(x.values())
+        elif not isinstance(x, collections.abc.Sequence):
             x = (x,)
         else:
             x = tuple(x)
