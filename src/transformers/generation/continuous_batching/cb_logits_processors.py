@@ -28,7 +28,7 @@ from .requests import FutureRequestState, logger
 # Abstract base class for all continuous batching logits processors
 class ContinuousBatchingLogitsProcessor(ABC):
 
-    tensors_needed: int
+    tensors_needed: int  # TODO: remove this, it's always 1 for now
     supported_kwargs: tuple[str]  # TODO: BUG: use this to filter kwargs at request creation time
     ignored_kwargs: tuple[str]  # TODO: BUG: use this to filter kwargs at request creation time
 
@@ -37,13 +37,13 @@ class ContinuousBatchingLogitsProcessor(ABC):
         pass
 
     @abstractmethod
-    def __call__(self, scores: torch.FloatTensor, per_token_params: torch.Tensor) -> torch.FloatTensor:
+    def __call__(self, scores: torch.FloatTensor, tensor_arg: torch.Tensor) -> torch.FloatTensor:
         """Applies the logits processor in a per-token manner.
         Args:
             - scores (torch.FloatTensor): The scores to process, with shape [1, num_tokens, vocab_size]
-            - per_token_params (torch.Tensor): The per-token parameters to use for the logits processor, with shape
-                [tensors_needed, num_tokens] and dtype torch.int32. The dtype might not be representative of the actual
-                data, for instance it's common to have a float32 tensor viewed as int32 (eg. temperature)
+            - tensor_arg (torch.Tensor): The tensor argument to use for the logits processor, with shape
+                [max_num_tokens] and dtype torch.int32. The dtype might not be representative of the actual data, for
+                instance it's common to have a float32 tensor viewed as int32 (eg. temperature)
         Returns:
             - torch.FloatTensor: The processed scores, with shape [1, num_tokens, vocab_size]
         """
@@ -65,6 +65,9 @@ class ContinuousBatchingLogitsProcessorList:
             self._convert_to_per_request_processors()
         # Validate and optionally filter processors based on their CB support
         self._validate_processors(drop_unsupported_processors)
+
+    def __repr__(self) -> str:
+        return f"ContinuousBatchingLogitsProcessorList(logits_processor={self.logits_processor}, tensors_required={self.tensors_required})"
 
     def _convert_to_per_request_processors(self) -> None:
         """Replaces the compatible logits processors with their per-request versions."""
@@ -127,7 +130,7 @@ class ContinuousBatchingLogitsProcessorList:
         for processor in self.logits_processor:
             if isinstance(processor, ContinuousBatchingLogitsProcessor):
                 tensorized_arg = processor.prepare_tensor_args(requests_in_batch)
-                arg_storage[current_arg_id, tensorized_arg.size(0)] = tensorized_arg.to(arg_storage.device)
+                arg_storage[current_arg_id, :tensorized_arg.size(0)] = tensorized_arg.to(arg_storage.device)
         return arg_storage
 
     def __call__(
@@ -163,8 +166,8 @@ class ContinuousBatchingTemperatureLogitsWarper(ContinuousBatchingLogitsProcesso
         # View the output with the bulk storage dtyep (int32) but keeps the underlying data the same
         return tensorized.view(dtype=torch.int32)
 
-    def __call__(self, scores: torch.FloatTensor, tensor_args: torch.Tensor) -> torch.FloatTensor:
-        temperatures = tensor_args[0].view(dtype=torch.float32)  # shape [N]
+    def __call__(self, scores: torch.FloatTensor, tensor_arg: torch.Tensor) -> torch.FloatTensor:
+        temperatures = tensor_arg[:scores.size(1)].view(dtype=torch.float32)  # shape [N]
         return scores / temperatures.view(1, -1, 1)  # broadcast to [1, N, V]
 
 
@@ -192,14 +195,14 @@ class ContinuousBatchingTopKLogitsWarper(ContinuousBatchingLogitsProcessor):
         tensor_args = torch.tensor(top_ks, dtype=torch.int32, device="cpu")
         return tensor_args
 
-    def __call__(self, scores: torch.FloatTensor, tensor_args: torch.Tensor) -> torch.FloatTensor:
+    def __call__(self, scores: torch.FloatTensor, tensor_arg: torch.Tensor) -> torch.FloatTensor:
         """Applies top-k selection to the scores tensor (shape [1, N, V])."""
         # Retrieve args
-        top_k = tensor_args[0]  # shape [N]
+        top_k = tensor_arg[:scores.size(1)]  # shape [N]
         # Compute top-k: sort descending, get threshold at position (top_k - 1) which is the k-th largest
         sorted_scores = torch.sort(scores, dim=-1, descending=True)[0]  # [1, N, V]
         # Gather threshold at index (top_k - 1) for each token (0-indexed, so k-th largest)
-        top_k_indices = (top_k - 1).view(1, -1, 1).to(dtype=torch.int64)  # [1, N, 1]
+        top_k_indices = top_k.view(1, -1, 1).to(dtype=torch.int64)  # [1, N, 1]
         thresholds = sorted_scores.gather(dim=-1, index=top_k_indices)  # [1, N, 1]
         mask = scores < thresholds
         scores_processed = scores.masked_fill(mask, self.filter_value)
@@ -231,10 +234,10 @@ class ContinuousBatchingTopPLogitsWarper(ContinuousBatchingLogitsProcessor):
         tensorized = torch.tensor(top_ps, dtype=torch.float32, device="cpu")
         return tensorized.view(dtype=torch.int32)
 
-    def __call__(self, scores: torch.FloatTensor, tensor_args: torch.Tensor) -> torch.FloatTensor:
+    def __call__(self, scores: torch.FloatTensor, tensor_arg: torch.Tensor) -> torch.FloatTensor:
         """Applies top-p (nucleus) sampling to the scores tensor (shape [1, N, V])."""
         # Retrieve args: top_p stored as float32 viewed as int32
-        top_p = tensor_args[0].view(dtype=torch.float32)  # shape [N]
+        top_p = tensor_arg[:scores.size(1)].view(dtype=torch.float32)  # shape [N]
 
         # Sort logits in ascending order
         sorted_logits, sorted_indices = torch.sort(scores, descending=False, dim=-1)  # [1, N, V]

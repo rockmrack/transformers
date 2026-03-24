@@ -549,9 +549,8 @@ class ContinuousBatchProcessor:
         function to be easier to trace with OpenTelemetry."""
         self.inputs_and_outputs.carry_over_tokens(batch_data["input_ids"], carry_over_ids, prev_output_ids)
         logits = self._model_forward(model, batch_data).float()
-        if self.logit_processor:
-            probs = self._process_logit(batch_data, logits)
-        self._sample(probs, batch_data["logits_indices"], output_ids)
+        scores = self._process_logit(batch_data, logits) if self.logit_processor else logits
+        self._sample(scores, batch_data["logits_indices"], output_ids)
 
     @traced(span_name="model_forward")
     def _model_forward(self, model: nn.Module, batch_data: dict) -> torch.Tensor:
@@ -570,13 +569,13 @@ class ContinuousBatchProcessor:
         return processed_logits_2d.view(batch_size, seq_len, vocab_size)
 
     @traced(span_name="sampling")
-    def _sample(self, probs: torch.Tensor, logits_indices: torch.Tensor, output_ids: torch.Tensor) -> None:
+    def _sample(self, scores: torch.Tensor, logits_indices: torch.Tensor, output_ids: torch.Tensor) -> None:
         # Apply softmax if we are sampling or if we are generating log probabilities
         if self.do_sample or self.return_logprobs:
-            probs = nn.functional.softmax(probs[0], dim=-1)  # shape [seq_len, vocab_size]
+            probs = nn.functional.softmax(scores[0], dim=-1)  # shape [seq_len, vocab_size]
         # Otherwise just remove the batch size dimension, which is always 1
         else:
-            probs = probs.squeeze(0)  # shape [seq_len, vocab_size]
+            probs = scores.squeeze(0)  # shape [seq_len, vocab_size]
 
         # Retrieve next tokens through sampling or argmax
         if self.do_sample:
@@ -587,7 +586,7 @@ class ContinuousBatchProcessor:
         # Maybe retrieve log probabilities
         if self.return_logprobs:
             per_token_probs = probs.gather(dim=1, index=next_tokens).squeeze(-1)
-            logprobs = per_token_probs.float().log()  # shape [seq_len]
+            logprobs = per_token_probs.log()  # shape [seq_len]
         # And always remove the extra dimension for the gather
         next_tokens = next_tokens.squeeze(-1)  # shape [seq_len]
 
