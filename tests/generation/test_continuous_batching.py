@@ -174,32 +174,32 @@ def regular_generate(
     generate_outputs = model.generate(**inputs.to(model.device), return_dict_in_generate=True, **generate_kwargs)
 
     # Keep only generated tokens
-    generated_tokens = []
+    all_generated_tokens = []
+    num_input_tokens = inputs.input_ids.shape[1]
     for i in range(len(user_messages)):
-        # Remove leff-side input and padding tokens
-        num_input_tokens = inputs.input_ids.shape[1]
+        # Remove left-side input and padding tokens
         generated_toks = generate_outputs.sequences[i, num_input_tokens:].tolist()
         # Remove right-side padding tokens
         while generated_toks[-1] == model.generation_config.pad_token_id:
             generated_toks.pop()
-        generated_tokens.append(generated_tokens)
+        all_generated_tokens.append(generated_toks)
 
     # Retrieve logprobs if the scores were requested
     per_prompt_logprobs = []
     if generate_kwargs.get("output_scores", False):
-        num_input_tokens = inputs.input_ids.shape[1]
         # Loop over prompts
         for i in range(len(user_messages)):
             logprobs = []
-            generated_tokens = generate_outputs.sequences[i, num_input_tokens:].tolist()
-            for score, token in zip(generate_outputs.scores, generated_tokens):
+            tokens_for_prompt = generate_outputs.sequences[i, num_input_tokens:].tolist()
+            for score, token in zip(generate_outputs.scores, tokens_for_prompt):
+                # Scores already have logits processors applied (including temperature)
                 probs = torch.nn.functional.softmax(score[i], dim=-1)
                 logprobs.append(probs[token].log().item())
             per_prompt_logprobs.append(logprobs)
     # Otherwise, return an empty list
     else:
         per_prompt_logprobs = []
-    return generated_tokens, per_prompt_logprobs
+    return all_generated_tokens, per_prompt_logprobs
 
 
 # Class for all continuous batching tests that do not require any accelerator. Usualy those test are faster to run.
@@ -1128,7 +1128,7 @@ class ContinuousBatchingWithAcceleratorTest(unittest.TestCase):
             text_fa3 = tokenizer.decode(out_fa3.generated_tokens, skip_special_tokens=True)
             self.assertEqual(text_fa2, text_fa3, f"Mismatch:\nFA2: {text_fa2}\nFA3: {text_fa3}")
 
-    @parameterized.expand([(False, False)])  # TODO: reinstate once fixed
+    @parameterized.expand([(False, False), (False, True), (True, False), (True, True)])
     @slow
     def test_per_request_logits_processors(self, use_cuda_graph: bool, use_async_batching: bool) -> None:
         """Tests that per-request logits processor kwargs (temperature, top_k, top_p) work correctly in generation."""
@@ -1188,37 +1188,61 @@ class ContinuousBatchingWithAcceleratorTest(unittest.TestCase):
         self.assertNotEqual(results[req0_id].logprobs, results[req1_id].logprobs)
 
         # Compare with regular generation for request 0
-        tokenizer, model = get_tokenizer_and_model(model_id, "sdpa", torch_device, torch.float32)
-        # Run regular generate
+        tokenizer, model = get_tokenizer_and_model(model_id, "flash_attention_2", torch_device)
+        # Build logits processor with do_sample=True (so temperature is included), then set do_sample=False
+        # for deterministic generation - same trick as CB uses
+        gen_config = GenerationConfig(
+            do_sample=True,
+            temperature=0.1,
+            max_new_tokens=10,
+            eos_token_id=eos_token_id,
+        )
+        logits_processor = model._get_logits_processor(gen_config)
+        gen_config.do_sample = False
         regular_generated_tokens, regular_logprobs = regular_generate(
             model=model,
             tokenizer=tokenizer,
             user_messages=user_messages,
-            temperature=0.1,
-            # top_k=10,
-            # top_p=0.9,
+            logits_processor=logits_processor,
             max_new_tokens=10,
             do_sample=False,
             output_scores=True,
             eos_token_id=eos_token_id
         )
         # Compare outputs
-        print(regular_generated_tokens[0])
-        print(results[req0_id].generated_tokens)
-        self.assertEqual(results[req0_id].generated_tokens, regular_generated_tokens)
+        self.assertEqual(results[req0_id].generated_tokens, regular_generated_tokens[0])
         # Compare logprobs
         delta = 2e-5 if use_cuda_graph else 1e-5
         for j, (cb_lp, exp_lp) in enumerate(zip(results[req0_id].logprobs, regular_logprobs[0])):
             error_msg = f"Request 0: logprob mismatch at position {j}: CB={cb_lp}, expected={exp_lp}"
             self.assertAlmostEqual(cb_lp, exp_lp, delta=delta, msg=error_msg)
 
-        # # Compare with regular generation for request 1 TODO: reinstate once fixed
-        # gen_output = self._regular_generate(model=model, tokenizer=tokenizer, users_msg=user_messages, generation_config_dict=gen_config_dict)
-        # print(f"Regular generation output:  {tokenizer.decode(gen_output, skip_special_tokens=True)}")
-        # print(f"Continuous batching output: {tokenizer.decode(results[req1_id].generated_tokens, skip_special_tokens=True)}")
-
-        # # # Compare with regular generation for request 2
-        # gen_config_dict = {"do_sample": True, "max_new_tokens": 10, "temperature": 2.0, "top_k": 50, "top_p": 0.99}
-        # gen_output = self._regular_generate(model=model, tokenizer=tokenizer, users_msg=user_messages, generation_config_dict=gen_config_dict)
-        # print(f"Regular generation output:  {tokenizer.decode(gen_output, skip_special_tokens=True)}")
-        # print(f"Continuous batching output: {tokenizer.decode(results[req2_id].generated_tokens, skip_special_tokens=True)}")
+        # Compare with regular generation for request 1
+        tokenizer, model = get_tokenizer_and_model(model_id, "flash_attention_2", torch_device)
+        # Build logits processor with do_sample=True (so temperature is included), then set do_sample=False
+        # for deterministic generation - same trick as CB uses
+        gen_config = GenerationConfig(
+            do_sample=True,
+            temperature=2.0,
+            max_new_tokens=10,
+            eos_token_id=eos_token_id,
+        )
+        logits_processor = model._get_logits_processor(gen_config)
+        gen_config.do_sample = False
+        regular_generated_tokens, regular_logprobs = regular_generate(
+            model=model,
+            tokenizer=tokenizer,
+            user_messages=user_messages,
+            logits_processor=logits_processor,
+            max_new_tokens=10,
+            do_sample=False,
+            output_scores=True,
+            eos_token_id=eos_token_id
+        )
+        # Compare outputs
+        self.assertEqual(results[req1_id].generated_tokens, regular_generated_tokens[0])
+        # Compare logprobs
+        delta = 2e-5 if use_cuda_graph else 1e-5
+        for j, (cb_lp, exp_lp) in enumerate(zip(results[req1_id].logprobs, regular_logprobs[0])):
+            error_msg = f"Request 0: logprob mismatch at position {j}: CB={cb_lp}, expected={exp_lp}"
+            self.assertAlmostEqual(cb_lp, exp_lp, delta=delta, msg=error_msg)
