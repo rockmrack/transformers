@@ -161,6 +161,36 @@ def get_generation_inputs(
         return inputs
 
 
+def regular_generate(
+    model: GenerationMixin,
+    tokenizer: AutoTokenizer,
+    user_messages: list[str],
+    **generate_kwargs,
+) -> tuple[torch.Tensor, list[list[float]]]:
+    # Run generation
+    print(f"{model = }")
+    print(f"{tokenizer = }")
+    inputs = get_generation_inputs(user_messages, tokenizer, for_continuous_batching=False)
+    generate_outputs = model.generate(**inputs.to(model.device), return_dict_in_generate=True, **generate_kwargs)
+
+    # Retrieve logprobs if the scores were requested
+    per_prompt_logprobs = []
+    if generate_kwargs.get("output_scores", False):
+        num_input_tokens = inputs.input_ids.shape[1]
+        # Loop over prompts
+        for i in range(len(user_messages)):
+            logprobs = []
+            generated_tokens = generate_outputs.sequences[i, num_input_tokens:].tolist()
+            for score, token in zip(generate_outputs.scores, generated_tokens):
+                probs = torch.nn.functional.softmax(score[i], dim=-1)
+                logprobs.append(probs[token].log().item())
+            per_prompt_logprobs.append(logprobs)
+    # Otherwise, return an empty list
+    else:
+        per_prompt_logprobs = []
+    return generate_outputs.sequences, per_prompt_logprobs
+
+
 # Class for all continuous batching tests that do not require any accelerator. Usualy those test are faster to run.
 class ContinuousBatchingNoAcceleratorTest(unittest.TestCase):
     @parameterized.expand(
@@ -634,69 +664,60 @@ class ContinuousBatchingWithAcceleratorTest(unittest.TestCase):
         """Test that log probabilities match between continuous batching and regular generate."""
         model_id = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 
+        # Retrieve tokenizer, model and eos_token_id (required otherwise logits will be misaligned)
         tokenizer, model = get_tokenizer_and_model(model_id, "sdpa", torch_device, torch.float32)
+        eos_token_id = model.config.eos_token_id  # type: ignore[attr-defined]
+
+        # Run CB generation
         user_messages = ["What is 2+2?", "Hello world"]
         input_ids = get_generation_inputs(user_messages, tokenizer, for_continuous_batching=True)
-
-        eos_token_id = model.config.eos_token_id  # required otherwise logits will be misaligned
         gen_config = GenerationConfig(max_new_tokens=10, do_sample=False, eos_token_id=eos_token_id)
-
         continuous_batching_config = ContinuousBatchingConfig(
             use_cuda_graph=use_cuda_graph,
             use_async_batching=use_async_batching,
             return_logprobs=True,
         )
-
         cb_outputs = model.generate_batch(
             inputs=input_ids, generation_config=gen_config, continuous_batching_config=continuous_batching_config
         )
 
-        # Load fresh model for regular generate (same pattern as parity tests)
-        model = AutoModelForCausalLM.from_pretrained(model_id, attn_implementation="sdpa", torch_dtype=torch.float32)
-        model = model.to(torch_device).eval()
-
-        # Run regular generate with output_scores to get logits
-        inputs = get_generation_inputs(user_messages, tokenizer, for_continuous_batching=False)
-
-        gen_config_regular = GenerationConfig(
-            max_new_tokens=10, do_sample=False, output_scores=True, eos_token_id=tokenizer.eos_token_id
-        )
-        generate_outputs = model.generate(
-            **inputs.to(torch_device), generation_config=gen_config_regular, return_dict_in_generate=True
+        # Load fresh model for regular generate
+        tokenizer, model = get_tokenizer_and_model(model_id, "sdpa", torch_device, torch.float32)
+        # Run regular generate
+        regular_outputs, regular_logprobs = regular_generate(
+            model=model,
+            tokenizer=tokenizer,
+            user_messages=user_messages,
+            max_new_tokens=10,
+            do_sample=False,
+            output_scores=True,
+            eos_token_id=eos_token_id
         )
 
         # Compare log_probs for each request, matching by prompt_ids
-        num_input_tokens = inputs.input_ids.shape[1]
-        for i in range(len(user_messages)):
-            # Find the corresponding CB output by matching prompt tokens
-            input_tokens = inputs.input_ids[i][inputs.attention_mask[i] == 1].tolist()
-            cb_output = None
-            for state in cb_outputs.values():
-                if state.prompt_ids == input_tokens:
-                    cb_output = state
-                    break
-            self.assertIsNotNone(cb_output, f"Could not find CB output for request {i}")
+        for i, cb_output in enumerate(cb_outputs.values()):
 
-            # Compute log_probs from regular generate scores
-            expected_logprobs = []
-            generated_tokens = generate_outputs.sequences[i, num_input_tokens:].tolist()
-            for score, token in zip(generate_outputs.scores, generated_tokens):
-                probs = torch.nn.functional.softmax(score[i], dim=-1)
-                expected_logprobs.append(probs[token].log().item())
+            # Compare Cb and regular generate outputs
+            cb_output_ids = cb_output.generated_tokens
+            regular_output_ids = regular_outputs[i]
+            self.assertEqual(len(cb_output_ids), len(regular_output_ids))
+            self.assertEqual(cb_output_ids, regular_output_ids)
 
-            # Truncate to same length (in case of padding differences)
-            min_len = min(len(cb_output.logprobs), len(expected_logprobs))
-            cb_logprobs = cb_output.logprobs[:min_len]
+            # Retrieve logprobs from CB and regular generate
+            cb_logprobs = cb_output.logprobs
+            expected_logprobs = regular_logprobs[i]
+
+            # Because of padding, we need to truncate to the same length
+            min_len = min(len(cb_logprobs), len(expected_logprobs))
+            cb_logprobs = cb_logprobs[:min_len]
             expected_logprobs = expected_logprobs[:min_len]
+            self.assertEqual(len(cb_logprobs), len(regular_logprobs))
 
-            # Compare with tolerance for floating point differences
+            # Compare with tolerance for floating point differences (because of padding, tol is higher for cuda graphs)
+            delta = 2e-5 if use_cuda_graph else 1e-5
             for j, (cb_lp, exp_lp) in enumerate(zip(cb_logprobs, expected_logprobs)):
-                self.assertAlmostEqual(
-                    cb_lp,
-                    exp_lp,
-                    delta=2e-5 if use_cuda_graph else 1e-5,  # cuda graphs add padding, hence lower precision
-                    msg=f"logprob mismatch at position {j} for request {i}: CB={cb_lp}, expected={exp_lp}",
-                )
+                error_msg = f"logprob mismatch at position {j} for request {i}: CB={cb_lp}, expected={exp_lp}"
+                self.assertAlmostEqual(cb_lp, exp_lp, delta=delta, msg=error_msg)
 
     def test_continuous_batching_with_default_compile_configs(self) -> None:
         """Test continuous batching with use_default_compile_configs=True in ContinuousBatchingConfig.
