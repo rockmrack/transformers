@@ -1242,7 +1242,6 @@ class ContinuousBatchingWithAcceleratorTest(unittest.TestCase):
         # Compare outputs
         self.assertEqual(results[req1_id].generated_tokens, regular_generated_tokens[0])
         # Compare logprobs
-        delta = 2e-5 if use_cuda_graph else 1e-5
         for j, (cb_lp, exp_lp) in enumerate(zip(results[req1_id].logprobs, regular_logprobs[0])):
-            error_msg = f"Request 0: logprob mismatch at position {j}: CB={cb_lp}, expected={exp_lp}"
+            error_msg = f"Request 1: logprob mismatch at position {j}: CB={cb_lp}, expected={exp_lp}"
             self.assertAlmostEqual(cb_lp, exp_lp, delta=delta, msg=error_msg)
