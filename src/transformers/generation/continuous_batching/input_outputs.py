@@ -24,6 +24,7 @@ from transformers.configuration_utils import PretrainedConfig
 from ...utils import get_available_devices
 from ...utils.metrics import traced
 from .cache import PagedAttentionCache
+from .cb_logits_processors import ContinuousBatchingLogitsProcessorList
 from .requests import TMP_TOKEN_ID, FutureRequestState, logger
 from .utils import CudaGraphBuffer, aligned_divide, attn_mask_is_needed, build_attention_mask
 
@@ -48,6 +49,7 @@ class PagedAttentionArgs:
         cache: The [`PagedAttentionCache`] instance managing the KV cache.
         block_table: Block table for paged KV cache. If provided, uses `flash_attn_with_kvcache` for fused attention +
             cache update. More information in src/transformers/integrations/flash_paged.py
+        logits_processor_args: List of tensors containing the arguments for the logits processors, one per request.
         use_cache: Whether to use caching (always `False` in continuous batching as the cache is managed externally).
     """
 
@@ -63,6 +65,7 @@ class PagedAttentionArgs:
     logits_indices: torch.Tensor
     cache: PagedAttentionCache
     block_table: torch.Tensor | None
+    logits_processor_args: torch.Tensor
     use_cache: bool = False
 
     def asdict(self) -> dict[str, Any]:
@@ -79,6 +82,7 @@ class PagedAttentionArgs:
             "logits_indices": self.logits_indices,
             "cache": self.cache,
             "block_table": self.block_table,
+            "logits_processor_args": self.logits_processor_args,
             "use_cache": self.use_cache,
         }
 
@@ -89,6 +93,8 @@ class ContinuousBatchingIOs:
     batch alone.
     """
 
+    bulk_inputs: int = 7
+
     def __init__(
         self,
         cache: PagedAttentionCache,
@@ -97,6 +103,7 @@ class ContinuousBatchingIOs:
         model_dtype: torch.dtype,
         max_graphs: int,
         return_logprobs: bool,
+        num_logits_processors_args: int,
     ) -> None:
         """Initialize the continuous batching I/O manager. Args:
         - cache: The [`PagedAttentionCache`] instance managing the KV cache. Meant to be unique.
@@ -105,6 +112,7 @@ class ContinuousBatchingIOs:
         - model_dtype: The data type for model computations.
         - max_graphs: Maximum number of CUDA graphs to cache. Uses LRU eviction when full.
         - return_logprobs: Whether to return log probabilities along with the token IDs.
+        - num_logits_processors_args: Number of logits processors arguments to allocate.
         """
         # Memoize attributes
         self.cache = cache
@@ -125,12 +133,12 @@ class ContinuousBatchingIOs:
         self.req_id_to_new_token_position: dict[str, int] = {}  # only used for async API
         self.graphs: CudaGraphBuffer = CudaGraphBuffer(max_graphs)
         # Setup static tensors and compute stream
-        self._setup_static_tensors()
+        self._setup_static_tensors(num_logits_processors_args)
         self._reset_static_tensors(full_reset=True)
         self.compute_stream = torch.cuda.Stream(device=self.device) if device.type == "cuda" else None
 
     @traced(standalone=True)
-    def _setup_static_tensors(self) -> None:
+    def _setup_static_tensors(self, num_logits_processors_args: int) -> None:
         """Allocates static tensors for generation inputs and outputs. This is called only once at init time, to avoid
         repeated allocations and enable CUDA graphs. All tensors are allocated with maximum possible sizes.
         The allocated tensors are:
@@ -149,9 +157,10 @@ class ContinuousBatchingIOs:
 
         # Small inputs are allocated as slices in a larget tensor aligned to 128 bytes (32 * 4b). This reduces the
         # reduces fragmentation, so it lowers the number of D2H transfers and speeds up transfers.
-        bulk_size = aligned_divide(max_batch_tokens + 1, 1, 32)
+        bulk_lines = self.bulk_inputs + num_logits_processors_args
+        bulk_columns = aligned_divide(max_batch_tokens + 1, 1, 32)
         self._bulk_input_tensor = torch.empty(
-            (7, bulk_size), dtype=torch.int32, device=self.device, pin_memory=pin_memory
+            (bulk_lines, bulk_columns), dtype=torch.int32, device=self.device, pin_memory=pin_memory
         )
 
         self.input_ids = self._bulk_input_tensor[0, :max_batch_tokens]
@@ -318,6 +327,7 @@ class ContinuousBatchingIOs:
     def prepare_batch_tensors(
         self,
         requests_in_batch: list[FutureRequestState],
+        logits_processors: ContinuousBatchingLogitsProcessorList,
         use_decode_fast_path: bool,
         num_q_tokens: int,
         max_kv_read: int,
@@ -366,7 +376,7 @@ class ContinuousBatchingIOs:
             # First we retrieve the lengths related to the request
             state = future_state.state
             past_length = state.position_offset
-            query_length = len(state.tokens_to_process)
+            query_length = future_state.query_length
             seqlens_k = self.cache.get_seqlens_k(past_length, query_length)
 
             # Update the internal state of the request
@@ -398,6 +408,11 @@ class ContinuousBatchingIOs:
                 self.req_id_to_new_token_position[state.request_id] = logits_indices[-1]
 
             self.requests_in_batch.append(future_state)
+
+        # Also prepare the tensor arguments for the logits processors
+        logits_processors.prepare_tensor_args(
+            requests_in_batch=requests_in_batch, arg_storage=self._bulk_input_tensor[self.bulk_inputs:],
+        )
 
         # When looping over request is done, we can build the actual tensors. This is faster than modifying the static
         # tensors inside the loop.
@@ -444,6 +459,7 @@ class ContinuousBatchingIOs:
             cu_seq_lens_q=self.cumulative_seqlens_q[: batch_size + 1],
             max_seqlen_q=self.max_seqlen_q,
             logits_indices=self.logits_indices[:q_size],
+            logits_processor_args=self._bulk_input_tensor[self.bulk_inputs:, :q_size],
             cu_seq_lens_k={},
             max_seqlen_k={},
             attention_mask={},
@@ -527,12 +543,15 @@ class HostDeviceIOPair:
         model_dtype: torch.dtype,
         max_graphs: int,
         return_logprobs: bool,
+        num_logits_processors_args: int,
     ) -> None:
         # The host IO has automatic pinned memory because it is created on the CPU
         self.host_io = ContinuousBatchingIOs(
-            cache, config, torch.device("cpu"), model_dtype, max_graphs, return_logprobs
+            cache, config, torch.device("cpu"), model_dtype, max_graphs, return_logprobs, num_logits_processors_args
         )
-        self.device_io = ContinuousBatchingIOs(cache, config, device, model_dtype, max_graphs, return_logprobs)
+        self.device_io = ContinuousBatchingIOs(
+            cache, config, device, model_dtype, max_graphs, return_logprobs, num_logits_processors_args
+        )
         # Create events only on CUDA devices
         self.h2d_over = torch.cuda.Event() if torch.cuda.is_available() else None
         self.compute_over = torch.cuda.Event() if torch.cuda.is_available() else None
@@ -608,6 +627,7 @@ class ContinuousBatchingAsyncIOs:
         model_dtype: torch.dtype,
         max_graphs: int,
         return_logprobs: bool,
+        num_logits_processors_args: int,
     ) -> None:
         # Async batching needs streams to function, so check is CUDA is available
         if not torch.cuda.is_available():
@@ -615,7 +635,7 @@ class ContinuousBatchingAsyncIOs:
         # IO pairs used to avoid race conditions
         self.current_pair = 0
         self.io_pairs = [
-            HostDeviceIOPair(cache, config, device, model_dtype, max_graphs, return_logprobs) for _ in range(2)
+            HostDeviceIOPair(cache, config, device, model_dtype, max_graphs, return_logprobs, num_logits_processors_args) for _ in range(2)
         ]
         # CUDA streams
         self.h2d_stream = torch.cuda.Stream(device=device)
@@ -637,12 +657,13 @@ class ContinuousBatchingAsyncIOs:
     def prepare_batch_tensors(
         self,
         requests_in_batch: list[FutureRequestState],
+        logits_processors: ContinuousBatchingLogitsProcessorList,
         use_decode_fast_path: bool,
         num_q_tokens: int,
         max_kv_read: int,
     ) -> None:
         io_pair = self.io_pairs[self.current_pair]
-        io_pair.host_io.prepare_batch_tensors(requests_in_batch, use_decode_fast_path, num_q_tokens, max_kv_read)
+        io_pair.host_io.prepare_batch_tensors(requests_in_batch, logits_processors, use_decode_fast_path, num_q_tokens, max_kv_read)
         io_pair.host_io.carry_over_ids.copy_(self.infer_carry_over_ids())
 
     def infer_carry_over_ids(self) -> torch.Tensor:

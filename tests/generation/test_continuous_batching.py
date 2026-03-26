@@ -1095,3 +1095,92 @@ class ContinuousBatchingWithAcceleratorTest(unittest.TestCase):
             text_fa2 = tokenizer.decode(out_fa2.generated_tokens, skip_special_tokens=True)
             text_fa3 = tokenizer.decode(out_fa3.generated_tokens, skip_special_tokens=True)
             self.assertEqual(text_fa2, text_fa3, f"Mismatch:\nFA2: {text_fa2}\nFA3: {text_fa3}")
+
+    def _regular_generate(
+        self,
+        model,
+        tokenizer: AutoTokenizer,
+        users_msg: list[str],
+        generation_config_dict: dict[str, Any],
+        use_cuda_graph: bool = False,
+        compile_config: CompileConfig | None = None,
+    ) -> torch.Tensor:
+        # And inputs
+        inputs = self._get_generation_inputs(user_messages=users_msg, tokenizer=tokenizer, for_continuous_batching=False)
+        # Generation without continuous batching
+        model = model.to(torch_device).eval()
+        for key, value in generation_config_dict.items():
+            setattr(model.generation_config, key, value)
+        return model.generate(**inputs.to(model.device))
+
+    @staticmethod
+    def _get_generation_inputs(
+        user_messages: list[str], tokenizer: AutoTokenizer, for_continuous_batching: bool = False
+    ) -> Any:
+        chats = [[{"role": "user", "content": user_message}] for user_message in user_messages]
+        if for_continuous_batching:
+            tokenized = [tokenizer.apply_chat_template(chat, add_generation_prompt=True) for chat in chats]
+            input_ids = [(x if isinstance(x, list) else x["input_ids"]) for x in tokenized]
+            return input_ids
+        else:
+            inputs = tokenizer.apply_chat_template(
+                chats,
+                add_generation_prompt=True,
+                return_tensors="pt",
+                padding=True,
+                return_dict=True,
+                return_attention_mask=True,
+            )
+            return inputs
+
+    def test_per_request_logits_processors(self) -> None:
+        """Tests that per-request logits processor kwargs (temperature, top_k, top_p) work correctly in generation."""
+        model_id = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+        tokenizer = AutoTokenizer.from_pretrained(model_id)
+        model = AutoModelForCausalLM.from_pretrained(model_id)
+        model = model.to(torch_device).eval()
+
+        # Same prompt for both requests
+        user_messages = ["Write a random number:"]
+        input_ids = self._get_generation_inputs(user_messages, tokenizer, for_continuous_batching=True)[0]
+
+        # Use the context manager to add requests with different per-request kwargs
+        cb_context_manager = model.continuous_batching_context_manager(
+            generation_config=GenerationConfig(do_sample=True, max_new_tokens=10),
+            continuous_batching_config=ContinuousBatchingConfig(use_cuda_graph=False, use_async_batching=False, per_request_processors=True),
+        )
+        with cb_context_manager as manager:
+            # Request 1: low temperature (more deterministic)
+            req1_id = manager.add_request(input_ids, max_new_tokens=10, temperature=0.1, top_k=10, top_p=0.9)
+            # Request 2: high temperature (more random)
+            req2_id = manager.add_request(input_ids, max_new_tokens=10, temperature=2.0, top_k=50, top_p=0.99)
+            # Collect results
+            results = {}
+            while len(results) < 1:
+                result = manager.get_result(timeout=1)
+                if result is not None and result.is_finished():
+                    results[result.request_id] = result
+                elif not manager.is_running():
+                    break
+
+        # Both requests should complete and have generated tokens
+        self.assertEqual(len(results), 2, f"Expected 2 results, got {len(results)}")
+        self.assertGreater(len(results[req1_id].generated_tokens), 0)
+        self.assertGreater(len(results[req2_id].generated_tokens), 0)
+        # Also ensure the generations were not the same
+        self.assertNotEqual(results[req1_id].generated_tokens, results[req2_id].generated_tokens)
+
+        # Compare with regular generation for request 1
+        tokenizer = AutoTokenizer.from_pretrained(model_id)
+        model = AutoModelForCausalLM.from_pretrained(model_id)
+        model = model.to(torch_device).eval()
+        gen_config_dict = {"do_sample": True, "max_new_tokens": 10, "temperature": 0.1} #, "top_k": 10, "top_p": 0.9}
+        gen_output = self._regular_generate(model=model, tokenizer=tokenizer, users_msg=user_messages, generation_config_dict=gen_config_dict)
+        print(f"Regular generation output:  {tokenizer.decode(gen_output, skip_special_tokens=True)}")
+        print(f"Continuous batching output: {tokenizer.decode(results[req1_id].generated_tokens, skip_special_tokens=True)}")
+
+        # # Compare with regular generation for request 2
+        gen_config_dict = {"do_sample": True, "max_new_tokens": 10, "temperature": 2.0, "top_k": 50, "top_p": 0.99}
+        gen_output = self._regular_generate(model=model, tokenizer=tokenizer, users_msg=user_messages, generation_config_dict=gen_config_dict)
+        print(f"Regular generation output:  {tokenizer.decode(gen_output, skip_special_tokens=True)}")
+        print(f"Continuous batching output: {tokenizer.decode(results[req2_id].generated_tokens, skip_special_tokens=True)}")

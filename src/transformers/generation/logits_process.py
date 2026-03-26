@@ -49,6 +49,10 @@ LOGITS_PROCESSOR_INPUTS_DOCSTRING = r"""
 class LogitsProcessor:
     """Abstract base class for all logit processors that can be applied during generation."""
 
+    # Whether the logit processor is supported by continuous batching.
+    # True if it is, False if it is not, None if it is not yet known.
+    supports_continuous_batching: bool | None = None
+
     @add_start_docstrings(LOGITS_PROCESSOR_INPUTS_DOCSTRING)
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
         raise NotImplementedError(
@@ -93,12 +97,6 @@ class LogitsProcessorList(list):
 
         return scores
 
-    def set_continuous_batching_context(self, logits_indices: torch.Tensor, cu_seq_lens_q: torch.Tensor) -> None:
-        """Forwards the continuous batching metadata to all logit processors that need it."""
-        for processor in self:
-            if hasattr(processor, "set_continuous_batching_context"):
-                processor.set_continuous_batching_context(logits_indices, cu_seq_lens_q)
-
 
 class MinLengthLogitsProcessor(LogitsProcessor):
     r"""
@@ -138,6 +136,8 @@ class MinLengthLogitsProcessor(LogitsProcessor):
     A number: one thousand, nine hundred and ninety-four
     ```
     """
+
+    supports_continuous_batching: bool = False
 
     def __init__(self, min_length: int, eos_token_id: int | list[int] | torch.Tensor, device: str = "cpu"):
         if not isinstance(min_length, int) or min_length < 0:
@@ -197,6 +197,8 @@ class MinNewTokensLengthLogitsProcessor(LogitsProcessor):
     A number: one thousand
     ```
     """
+
+    supports_continuous_batching = False
 
     def __init__(
         self,
@@ -281,6 +283,8 @@ class TemperatureLogitsWarper(LogitsProcessor):
     ```
     """
 
+    supports_continuous_batching = True
+
     def __init__(self, temperature: float):
         if not isinstance(temperature, float) or not (temperature > 0):
             except_msg = (
@@ -349,6 +353,8 @@ class RepetitionPenaltyLogitsProcessor(LogitsProcessor):
     ```
     """
 
+    supports_continuous_batching = False
+
     def __init__(self, penalty: float, prompt_ignore_length: int | None = None):
         if not isinstance(penalty, float) or not (penalty > 0):
             raise ValueError(f"`penalty` has to be a strictly positive float, but is {penalty}")
@@ -362,10 +368,6 @@ class RepetitionPenaltyLogitsProcessor(LogitsProcessor):
         self.prompt_ignore_length = prompt_ignore_length
         self.logits_indices = None
         self.cu_seq_lens_q = None
-
-    def set_continuous_batching_context(self, logits_indices: torch.Tensor, cu_seq_lens_q: torch.Tensor):
-        self.logits_indices = logits_indices
-        self.cu_seq_lens_q = cu_seq_lens_q
 
     @add_start_docstrings(LOGITS_PROCESSOR_INPUTS_DOCSTRING)
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:

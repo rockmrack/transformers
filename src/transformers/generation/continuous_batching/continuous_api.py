@@ -30,12 +30,13 @@ from tqdm.contrib.logging import logging_redirect_tqdm
 
 from ...configuration_utils import PretrainedConfig
 from ...generation.configuration_utils import ContinuousBatchingConfig, GenerationConfig
-from ...generation.logits_process import LogitsProcessorList
 from ...modeling_flash_attention_utils import lazy_import_paged_flash_attention
 from ...utils.generic import is_flash_attention_requested
 from ...utils.logging import logging
 from ...utils.metrics import ContinuousBatchProcessorMetrics, attach_tracer, traced
+from ..logits_process import LogitsProcessorList
 from .cache import PagedAttentionCache
+from .cb_logits_processors import ContinuousBatchingLogitsProcessorList
 from .input_outputs import ContinuousBatchingAsyncIOs, ContinuousBatchingIOs
 from .requests import GenerationOutput, RequestState, RequestStatus, logger
 from .scheduler import SCHEDULER_MAPPING, FIFOScheduler, Scheduler
@@ -138,6 +139,7 @@ class ContinuousBatchProcessor:
         config: PretrainedConfig,
         generation_config: GenerationConfig,
         continuous_batching_config: ContinuousBatchingConfig,
+        logit_processor: ContinuousBatchingLogitsProcessorList,
         input_queue: queue.Queue,
         output_router: OutputRouter,
         stop_event: threading.Event,
@@ -151,6 +153,8 @@ class ContinuousBatchProcessor:
             cache: A [`PagedAttentionCache`] object
             config: The model configuration
             generation_config: The generation configuration
+            continuous_batching_config: The continuous batching configuration
+            logit_processor: The [`ContinuousBatchingLogitsProcessorList`] object used to process the logits.
             input_queue: Queue for incoming requests
             output_router: An [`OutputRouter`] object that routes outputs to handlers or the output queue.
             stop_event: Event to signal processing should stop
@@ -161,6 +165,7 @@ class ContinuousBatchProcessor:
         self.cache = cache
         self.config = config
         self.cb_config = continuous_batching_config
+        self.logit_processor = logit_processor
         self.input_queue = input_queue
         self.output_router = output_router
         self.stop_event = stop_event
@@ -214,11 +219,11 @@ class ContinuousBatchProcessor:
             # Since in async there are 2 IO pairs, there are also 2 graph buffers: we divide the max_cached_graphs by 2
             max_cached_graphs = ceil(self.max_cached_graphs / 2)
             self.inputs_and_outputs = ContinuousBatchingAsyncIOs(
-                cache, config, model_device, model_dtype, max_cached_graphs, self.return_logprobs
+                cache, config, model_device, model_dtype, max_cached_graphs, self.return_logprobs, self.logit_processor.tensors_required
             )
         else:
             self.inputs_and_outputs = ContinuousBatchingIOs(
-                cache, config, model_device, model_dtype, self.max_cached_graphs, self.return_logprobs
+                cache, config, model_device, model_dtype, self.max_cached_graphs, self.return_logprobs, self.logit_processor.tensors_required
             )
         # Set up the graph pool. This allows all graphs to share the same memory pool, which is fine because they never
         # run concurrently. This greatly saves memory.
@@ -371,7 +376,7 @@ class ContinuousBatchProcessor:
             max_kv_read = pad_to_interval(max_kv_read, self.kv_padding_interval_size, self.cache.num_pages)
 
         self.inputs_and_outputs.prepare_batch_tensors(
-            requests_in_batch, use_decode_fast_path, num_q_tokens, max_kv_read
+            requests_in_batch, self.logit_processor, use_decode_fast_path, num_q_tokens, max_kv_read
         )
         self.metrics.record_kv_cache_memory_metrics(self.cache)
         return True
@@ -482,7 +487,7 @@ class ContinuousBatchProcessor:
 
     @traced
     @torch.no_grad()
-    def _generation_step(self, model: nn.Module, logit_processor: LogitsProcessorList) -> None:
+    def _generation_step(self, model: nn.Module) -> None:
         """Perform a single generation step."""
 
         # Retrieve the model kwargs with or without padding
@@ -500,7 +505,7 @@ class ContinuousBatchProcessor:
         if not self.use_cuda_graph:
             maybe_stream = torch.cuda.stream(compute_stream) if compute_stream is not None else nullcontext()
             with maybe_stream:
-                forward_fn(model, batch_data, logit_processor, carry_over_ids, prev_output_ids, output_ids)
+                forward_fn(model, batch_data, carry_over_ids, prev_output_ids, output_ids)
 
         # Otherwise, we use create or replay the graph (cuda is available in this path)
         else:
@@ -511,7 +516,7 @@ class ContinuousBatchProcessor:
                     graph.replay()
             # Otherwise, the graph does not exist, so we create it
             else:
-                args = (model, batch_data, logit_processor, carry_over_ids, prev_output_ids, output_ids)
+                args = (model, batch_data, carry_over_ids, prev_output_ids, output_ids)
                 self.capture_graph(forward_fn, compute_stream, *args)
 
         # In any case, we transfer the outputs to the host
@@ -536,7 +541,6 @@ class ContinuousBatchProcessor:
         self,
         model: nn.Module,
         batch_data: dict,
-        logit_processor: LogitsProcessorList,
         carry_over_ids: torch.Tensor,
         prev_output_ids: torch.Tensor,
         output_ids: torch.Tensor,
@@ -544,8 +548,9 @@ class ContinuousBatchProcessor:
         """This function performs the forward pass, logits processing, and sampling; which are broken down into smaller
         function to be easier to trace with OpenTelemetry."""
         self.inputs_and_outputs.carry_over_tokens(batch_data["input_ids"], carry_over_ids, prev_output_ids)
-        logits = self._model_forward(model, batch_data)
-        probs = self._process_logit(batch_data, logits, logit_processor)
+        logits = self._model_forward(model, batch_data).float()
+        if self.logit_processor:
+            probs = self._process_logit(batch_data, logits)
         self._sample(probs, batch_data["logits_indices"], output_ids)
 
     @traced(span_name="model_forward")
@@ -553,20 +558,14 @@ class ContinuousBatchProcessor:
         return model(**batch_data).logits
 
     @traced(span_name="logit_processing")
-    def _process_logit(
-        self, batch_data: dict, logits: torch.Tensor, logit_processor: LogitsProcessorList
-    ) -> torch.Tensor:
-        # Pass continuous batching context to logits processor if it supports it.
-        if hasattr(logit_processor, "set_continuous_batching_context"):
-            logit_processor.set_continuous_batching_context(batch_data["logits_indices"], batch_data["cu_seq_lens_q"])
+    def _process_logit(self, batch_data: dict, logits: torch.Tensor) -> torch.Tensor:
         # Handle shape compatibility: logit processors expect 2D tensors [batch_size, vocab_size]
         # but continuous batching always produces 3D tensors [batch_size, seq_len, vocab_size]
         batch_size, seq_len, vocab_size = logits.shape
-        # NOTE: to be an exact match with generate, we should also convert logits2d to float32 here, but it's not needed in practice
         logits_2d = logits.view(batch_size * seq_len, vocab_size)
         input_ids_2d = batch_data["input_ids"].view(batch_size * seq_len)
-        # Process with 2D tensors#
-        processed_logits_2d = logit_processor(input_ids_2d, logits_2d)
+        # Process with 2D tensors
+        processed_logits_2d = self.logit_processor(input_ids_2d, logits_2d, batch_data["logits_processor_args"])
         # Reshape back to 3D
         return processed_logits_2d.view(batch_size, seq_len, vocab_size)
 
@@ -752,9 +751,14 @@ class ContinuousBatchingManager:
         self._request_lock = threading.Lock()
 
         # Generation config related arguments
-        self.logit_processor: LogitsProcessorList = self.model._get_logits_processor(generation_config)
         num_return_sequences = getattr(generation_config, "num_return_sequences", None)
         self.num_return_sequences = num_return_sequences if num_return_sequences is not None else 1
+
+        self.logit_processor = ContinuousBatchingLogitsProcessorList(
+            logits_processor=self.model._get_logits_processor(generation_config),
+            per_request_processors=self.continuous_batching_config.per_request_processors,
+            drop_unsupported_processors=self.continuous_batching_config.drop_unsupported_processors,
+        )
 
         # Cuda graph behavior is determined below using either user-specified arguments or heuristics
         is_attn_mask_needed = attn_mask_is_needed(self.model.config)
@@ -858,13 +862,18 @@ class ContinuousBatchingManager:
         streaming: bool = False,
         record_timestamps: bool = False,
         eos_token_id: int | list[int] | None = None,
+        **logit_processor_kwargs: dict,
     ) -> str:
         """Add a new generation request to the queue.
 
         Args:
             input_ids: Input token IDs to use as prompt
             request_id: Optional custom request ID (auto-generated if None)
-            **kwargs: Additional generation parameters
+            max_new_tokens: Maximum number of new tokens to generate
+            streaming: Whether to stream tokens as they're generated
+            record_timestamps: Whether to record timestamps for each generated token
+            eos_token_id: End-of-sequence token ID(s)
+            logit_processor_kwargs: Keyword arguments for the logits processor.
 
         Returns:
             str: The request ID
@@ -886,6 +895,7 @@ class ContinuousBatchingManager:
             max_new_tokens=max_new_tokens,
             eos_token_id=eos_token_id,
             streaming=streaming,
+            logit_processor_kwargs=logit_processor_kwargs,
         )
 
         # Use block=True with timeout to handle backpressure if queue is full
@@ -899,6 +909,7 @@ class ContinuousBatchingManager:
         max_new_tokens: int | None = None,
         streaming: bool = False,
         record_timestamps: bool = False,
+        **logit_processor_kwargs: dict,
     ) -> None:
         # Infer the request ids of all incoming requests
         with self._request_lock:
@@ -915,7 +926,15 @@ class ContinuousBatchingManager:
         eos_token_id = -1 if eos_token_id is None else eos_token_id
         # Add requests in order
         for request_id, input_ids in ids_and_inputs:
-            self.add_request(input_ids, request_id, max_new_tokens, streaming, record_timestamps, eos_token_id)
+            self.add_request(
+                input_ids=input_ids,
+                request_id=request_id,
+                max_new_tokens=max_new_tokens,
+                streaming=streaming,
+                record_timestamps=record_timestamps,
+                eos_token_id=eos_token_id,
+                **logit_processor_kwargs,
+            )
 
     def cancel_request(self, request_id: str) -> None:
         """Cancel a request by its ID.
@@ -997,7 +1016,7 @@ class ContinuousBatchingManager:
         """Perform a single generation step. This is mostly cuda graphed"""
         if self.batch_processor is None:
             raise RuntimeError("Tried to perform a generation step before the batch processor was initialized.")
-        self.batch_processor._generation_step(self.model, self.logit_processor)
+        self.batch_processor._generation_step(self.model)
 
     def _create_batch_processor(self) -> ContinuousBatchProcessor:
         # Create the PagedAttentionCache
@@ -1023,6 +1042,7 @@ class ContinuousBatchingManager:
             config=self.model.config,
             generation_config=self.generation_config,
             continuous_batching_config=self.continuous_batching_config,
+            logit_processor=self.logit_processor,
             input_queue=self.input_queue,
             output_router=self.output_router,
             stop_event=self.stop_event,
