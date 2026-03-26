@@ -281,6 +281,7 @@ class ContinuousBatchProcessor:
                 state = self.input_queue.get_nowait()
                 if state is None:  # Sentinel value
                     continue
+                self.logit_processor.check_kwargs(state.logit_processor_kwargs)
                 self.scheduler.add_waiting_request(state)
 
             except queue.Empty:

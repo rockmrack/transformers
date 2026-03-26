@@ -28,8 +28,8 @@ from .requests import FutureRequestState, logger
 # Abstract base class for all continuous batching logits processors
 class ContinuousBatchingLogitsProcessor(ABC):
 
-    supported_kwargs: tuple[str, ...]  # TODO: use this to filter kwargs at request creation time
-    ignored_kwargs: tuple[str, ...]  # TODO: use this to filter kwargs at request creation time
+    supported_kwargs: tuple[str, ...]  # Kwargs that this processor actively uses
+    ignored_kwargs: tuple[str, ...]  # Kwargs that this processor recognizes but ignores
 
     @abstractmethod
     def prepare_tensor_args(self, requests_in_batch: list[FutureRequestState]) -> torch.Tensor:
@@ -64,6 +64,7 @@ class ContinuousBatchingLogitsProcessorList:
             self._convert_to_per_request_processors()
         # Validate and optionally filter processors based on their CB support
         self._validate_processors(drop_unsupported_processors)
+        self._retrieve_processors_kwargs()
 
     def __repr__(self) -> str:
         return f"ContinuousBatchingLogitsProcessorList(logits_processor={self.logits_processor}, tensors_required={self.tensors_required})"
@@ -71,6 +72,8 @@ class ContinuousBatchingLogitsProcessorList:
     def clear(self) -> None:
         self.logits_processor = LogitsProcessorList()
         self.tensors_required = 0
+        self.supported_keys = set()
+        self.ignored_keys = set()
 
     def _convert_to_per_request_processors(self) -> None:
         """Replaces the compatible logits processors with their per-request versions."""
@@ -125,6 +128,36 @@ class ContinuousBatchingLogitsProcessorList:
 
     def __bool__(self) -> bool:
         return bool(self.logits_processor)
+
+    def _retrieve_processors_kwargs(self) -> None:
+        """Retrieves the set of supported and ignored kwargs from continuous batching processors."""
+        self.supported_keys = set()
+        self.ignored_keys = set()
+        for processor in self.logits_processor:
+            if isinstance(processor, ContinuousBatchingLogitsProcessor):
+                self.supported_keys.update(processor.supported_kwargs)
+                self.ignored_keys.update(processor.ignored_kwargs)
+
+    def check_kwargs(self, kwargs: dict) -> None:
+        """Checks that the provided kwargs are compatible with the current CB processors. Warn for ignored kwargs."""
+        if not kwargs:
+            return None
+        # Stop if there are only supported keys
+        problematic_keys = set(kwargs.keys()) - self.supported_keys
+        if not problematic_keys:
+            return None
+        # Check if there are unknown keys
+        unknown_keys = set(kwargs.keys()) - self.ignored_keys
+        if unknown_keys:
+            raise ValueError(
+                f"Unknown logit_processor_kwargs: {unknown_keys}. {self.supported_keys = } and {self.ignored_keys = }"
+                "If you expect a key to not be ignored, make sure its default value (in the generation config) is not "
+                "None. Eg. if temperature is None or 1.0 at creation time, no processor will be created for temperature"
+            )
+        # If there are none, throw a warning about the ignored keys
+        logger.warning(
+            f"Ignored logit_processor_kwargs: {problematic_keys}. {self.supported_keys = } and {self.ignored_keys = }"
+        )
 
     def prepare_tensor_args(
         self, requests_in_batch: list[FutureRequestState], arg_storage: torch.Tensor
