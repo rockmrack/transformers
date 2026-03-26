@@ -28,9 +28,8 @@ from .requests import FutureRequestState, logger
 # Abstract base class for all continuous batching logits processors
 class ContinuousBatchingLogitsProcessor(ABC):
 
-    tensors_needed: int  # TODO: remove this, it's always 1 for now
-    supported_kwargs: tuple[str]  # TODO: BUG: use this to filter kwargs at request creation time
-    ignored_kwargs: tuple[str]  # TODO: BUG: use this to filter kwargs at request creation time
+    supported_kwargs: tuple[str, ...]  # TODO: use this to filter kwargs at request creation time
+    ignored_kwargs: tuple[str, ...]  # TODO: use this to filter kwargs at request creation time
 
     @abstractmethod
     def prepare_tensor_args(self, requests_in_batch: list[FutureRequestState]) -> torch.Tensor:
@@ -121,8 +120,8 @@ class ContinuousBatchingLogitsProcessorList:
                     logger.warning(f"{msg} Keeping it because {drop_unsupported = }.")
                     filtered_processors.append(processor)
 
-        # Update the list of logits processors
-        self.logits_processor = filtered_processors
+        # Update the list of logits processors (preserve LogitsProcessorList type)
+        self.logits_processor = LogitsProcessorList(filtered_processors)
 
     def __bool__(self) -> bool:
         return bool(self.logits_processor)
@@ -155,9 +154,8 @@ class ContinuousBatchingLogitsProcessorList:
 
 # Here are all the continuous batching logits processors that are supported
 class ContinuousBatchingTemperatureLogitsWarper(ContinuousBatchingLogitsProcessor):
-    tensors_needed: int = 1
-    supported_kwargs: tuple[str] = ("temperature",)
-    ignored_kwargs: tuple[str] = ()
+    supported_kwargs: tuple[str, ...] = ("temperature",)
+    ignored_kwargs: tuple[str, ...] = ()
 
     def __init__(self, temperature: float) -> None:
         self.temperature = temperature
@@ -178,9 +176,8 @@ class ContinuousBatchingTemperatureLogitsWarper(ContinuousBatchingLogitsProcesso
 
 
 class ContinuousBatchingTopKLogitsWarper(ContinuousBatchingLogitsProcessor):
-    tensors_needed: int = 1 # top_k only, filter values must be uniform across requests
-    supported_kwargs: tuple[str] = ("top_k",)
-    ignored_kwargs: tuple[str] = ("filter_value", "min_tokens_to_keep")
+    supported_kwargs: tuple[str, ...] = ("top_k",)
+    ignored_kwargs: tuple[str, ...] = ("filter_value", "min_tokens_to_keep")
 
     def __init__(self, top_k: int, filter_value: float = -float("Inf"), min_tokens_to_keep: int = 1):
         if not isinstance(top_k, int) or top_k <= 0:
@@ -216,9 +213,8 @@ class ContinuousBatchingTopKLogitsWarper(ContinuousBatchingLogitsProcessor):
 
 
 class ContinuousBatchingTopPLogitsWarper(ContinuousBatchingLogitsProcessor):
-    tensors_needed: int = 1  # top_p only, filter values must be uniform across requests
-    supported_kwargs: tuple[str] = ("top_p", )
-    ignored_kwargs: tuple[str] = ("filter_value", "min_tokens_to_keep")
+    supported_kwargs: tuple[str, ...] = ("top_p",)
+    ignored_kwargs: tuple[str, ...] = ("filter_value", "min_tokens_to_keep")
 
     def __init__(self, top_p: float, filter_value: float = -float("Inf"), min_tokens_to_keep: int = 1):
         top_p = float(top_p)
