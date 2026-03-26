@@ -69,6 +69,10 @@ class ContinuousBatchingLogitsProcessorList:
     def __repr__(self) -> str:
         return f"ContinuousBatchingLogitsProcessorList(logits_processor={self.logits_processor}, tensors_required={self.tensors_required})"
 
+    def clear(self) -> None:
+        self.logits_processor = LogitsProcessorList()
+        self.tensors_required = 0
+
     def _convert_to_per_request_processors(self) -> None:
         """Replaces the compatible logits processors with their per-request versions."""
         for i, processor in enumerate(self.logits_processor):

@@ -616,7 +616,7 @@ class ContinuousBatchingAsyncIOs:
           - <-N: device to host transfer of batch N
           - UP N: update of batch N
 
-    You can see that the GPU is almost always busy, execpt where the █ is.
+    You can see that the GPU is almost always busy, except where the █ is.
     Proper ordering of steps is ensured through the use of CUDA events and streams.
     """
 

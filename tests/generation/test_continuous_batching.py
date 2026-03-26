@@ -720,7 +720,7 @@ class ContinuousBatchingWithAcceleratorTest(unittest.TestCase):
             min_len = min(len(cb_logprobs), len(expected_logprobs))
             cb_logprobs = cb_logprobs[:min_len]
             expected_logprobs = expected_logprobs[:min_len]
-            self.assertEqual(len(cb_logprobs), len(regular_logprobs))
+            self.assertEqual(len(cb_logprobs), len(expected_logprobs))
 
             # Compare with tolerance for floating point differences (because of padding, tol is higher for cuda graphs)
             delta = 2e-5 if use_cuda_graph else 1e-5
@@ -822,7 +822,7 @@ class ContinuousBatchingWithAcceleratorTest(unittest.TestCase):
 
         tokenizer, model = get_tokenizer_and_model(model_id, "sdpa", torch_device)
         manager = model.init_continuous_batching()
-        manager.logit_processor = LogitsProcessorList()
+        manager.logit_processor.clear()
         manager.start()
 
         user_messages = ["What is the Transformers library known for?"]
@@ -916,7 +916,7 @@ class ContinuousBatchingWithAcceleratorTest(unittest.TestCase):
             continuous_batching_config=ContinuousBatchingConfig(block_size=32),
         )
         with cb_context_manager as manager:
-            manager.logit_processor = LogitsProcessorList()
+            manager.logit_processor.clear()
 
             # Create a request with at least 32 tokens but less than 64 so prefill only generates one complete block
             inputs = get_generation_inputs([input_msg], tokenizer, for_continuous_batching=True)[0]
@@ -1254,3 +1254,4 @@ class ContinuousBatchingWithAcceleratorTest(unittest.TestCase):
         for j, (cb_lp, exp_lp) in enumerate(zip(results[req1_id].logprobs, regular_logprobs[0])):
             error_msg = f"Request 1: logprob mismatch at position {j}: CB={cb_lp}, expected={exp_lp}"
             self.assertAlmostEqual(cb_lp, exp_lp, delta=delta, msg=error_msg)
+
