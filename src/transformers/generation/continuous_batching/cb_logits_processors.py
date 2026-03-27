@@ -27,7 +27,6 @@ from .requests import FutureRequestState, logger
 
 # Abstract base class for all continuous batching logits processors
 class ContinuousBatchingLogitsProcessor(ABC):
-
     supported_kwargs: tuple[str, ...]  # Kwargs that this processor actively uses
     ignored_kwargs: tuple[str, ...]  # Kwargs that this processor recognizes but ignores
 
@@ -48,8 +47,25 @@ class ContinuousBatchingLogitsProcessor(ABC):
         """
         pass
 
+
 # Main class for managing a list of processors (CB version or not) for batched generation
 class ContinuousBatchingLogitsProcessorList:
+    """A class to hold logits processors for continuous batching (CB).
+
+    Each processor has a base class, which is the one used in regular `generate` and some have a per-request version
+    adapted for CB. The list of logits processors present is generated using  the `_get_logits_processor` method from
+    the model, which will only include processors if their presence is required by the generation config. For instance,
+    if you want to use temperature scaling, you need to specify a temperature that's neither None nor 1.0. Otherwise
+    no processors will be created for temperature, and per-request temperature scaling will not be available.
+
+    On support of base processors:
+        Some base processors are not supported by CB and will be dropped when this class is instanciated. Some
+        processors have not yet been categorized as supported or not and will be kept but with a warning. All processors
+        can be kept by setting the flag `drop_unsupported_processors` to False.
+    On per-request processors:
+        Some base processors have a per-request version adapted for CB and will be converted to their per-request
+        version when this class is instanciated. Unless the flag `per_request_processors` is set to False.
+    """
 
     def __init__(
         self,
@@ -95,7 +111,6 @@ class ContinuousBatchingLogitsProcessorList:
         """
         filtered_processors = []
         for processor in self.logits_processor:
-
             # Filter based on class: keep all ContinuousBatchingLogitsProcessor and error on non logits processors
             class_name = processor.__class__.__name__
             if isinstance(processor, ContinuousBatchingLogitsProcessor):
@@ -166,7 +181,7 @@ class ContinuousBatchingLogitsProcessorList:
         for processor in self.logits_processor:
             if isinstance(processor, ContinuousBatchingLogitsProcessor):
                 tensorized_arg = processor.prepare_tensor_args(requests_in_batch)
-                arg_storage[current_arg_id, :tensorized_arg.size(0)] = tensorized_arg.to(arg_storage.device)
+                arg_storage[current_arg_id, : tensorized_arg.size(0)] = tensorized_arg.to(arg_storage.device)
                 current_arg_id += 1
         return arg_storage
 
@@ -181,8 +196,6 @@ class ContinuousBatchingLogitsProcessorList:
             else:
                 scores = processor(input_ids, scores)
         return scores
-
-
 
 
 # Here are all the continuous batching logits processors that are supported
@@ -203,7 +216,7 @@ class ContinuousBatchingTemperatureLogitsWarper(ContinuousBatchingLogitsProcesso
         return tensorized.view(dtype=torch.int32)
 
     def __call__(self, scores: torch.FloatTensor, tensor_arg: torch.Tensor) -> torch.FloatTensor:
-        temperatures = tensor_arg[:scores.size(1)].view(dtype=torch.float32)  # shape [N]
+        temperatures = tensor_arg[: scores.size(1)].view(dtype=torch.float32)  # shape [N]
         scores_processed = scores / temperatures.view(1, -1, 1)  # broadcast to [1, N, V]
         return scores_processed
 
@@ -234,7 +247,7 @@ class ContinuousBatchingTopKLogitsWarper(ContinuousBatchingLogitsProcessor):
     def __call__(self, scores: torch.FloatTensor, tensor_arg: torch.Tensor) -> torch.FloatTensor:
         """Applies top-k selection to the scores tensor (shape [1, N, V])."""
         # Retrieve args
-        top_k = tensor_arg[:scores.size(1)]  # shape [N]
+        top_k = tensor_arg[: scores.size(1)]  # shape [N]
         # Compute top-k: sort descending, get threshold at position (top_k - 1) which is the k-th largest
         sorted_scores = torch.sort(scores, dim=-1, descending=True)[0]  # [1, N, V]
         # Gather threshold at index (top_k - 1) for each token (0-indexed, so k-th largest)
@@ -272,7 +285,7 @@ class ContinuousBatchingTopPLogitsWarper(ContinuousBatchingLogitsProcessor):
     def __call__(self, scores: torch.FloatTensor, tensor_arg: torch.Tensor) -> torch.FloatTensor:
         """Applies top-p (nucleus) sampling to the scores tensor (shape [1, N, V])."""
         # Retrieve args: top_p stored as float32 viewed as int32
-        top_p = tensor_arg[:scores.size(1)].view(dtype=torch.float32)  # shape [N]
+        top_p = tensor_arg[: scores.size(1)].view(dtype=torch.float32)  # shape [N]
 
         # Sort logits in ascending order
         sorted_logits, sorted_indices = torch.sort(scores, descending=False, dim=-1)  # [1, N, V]
@@ -284,7 +297,7 @@ class ContinuousBatchingTopPLogitsWarper(ContinuousBatchingLogitsProcessor):
         sorted_indices_to_remove = cumulative_probs <= threshold  # [1, N, V]
 
         # Keep at least min_tokens_to_keep (always keep the last tokens in sorted order = highest prob)
-        sorted_indices_to_remove[..., -self.min_tokens_to_keep:] = False
+        sorted_indices_to_remove[..., -self.min_tokens_to_keep :] = False
 
         # Scatter sorted mask back to original indexing
         indices_to_remove = sorted_indices_to_remove.scatter(-1, sorted_indices, sorted_indices_to_remove)

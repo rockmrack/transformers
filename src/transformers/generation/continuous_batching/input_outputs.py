@@ -262,8 +262,8 @@ class ContinuousBatchingIOs:
         kv_len = self.read_index_storage.size(-1) if full_reset else self.max_kv_read
 
         # Reset the attributes part of the bulk input tensor in one kernel
-        self._bulk_input_tensor[:self.bulk_inputs, : q_len + 1].zero_()
-        self._bulk_input_tensor[self.bulk_inputs:, : q_len + 1].fill_(1)
+        self._bulk_input_tensor[: self.bulk_inputs, : q_len + 1].zero_()
+        self._bulk_input_tensor[self.bulk_inputs :, : q_len + 1].fill_(1)  # better default value for logits processors
         self.max_seqlen_q = 0
 
         # Reset the logits indices and output ids
@@ -412,7 +412,8 @@ class ContinuousBatchingIOs:
 
         # Also prepare the tensor arguments for the logits processors
         logits_processors.prepare_tensor_args(
-            requests_in_batch=requests_in_batch, arg_storage=self._bulk_input_tensor[self.bulk_inputs:],
+            requests_in_batch=requests_in_batch,
+            arg_storage=self._bulk_input_tensor[self.bulk_inputs :],
         )
 
         # When looping over request is done, we can build the actual tensors. This is faster than modifying the static
@@ -460,7 +461,7 @@ class ContinuousBatchingIOs:
             cu_seq_lens_q=self.cumulative_seqlens_q[: batch_size + 1],
             max_seqlen_q=self.max_seqlen_q,
             logits_indices=self.logits_indices[:q_size],
-            logits_processor_args=self._bulk_input_tensor[self.bulk_inputs:, :q_size],
+            logits_processor_args=self._bulk_input_tensor[self.bulk_inputs :, :q_size],
             cu_seq_lens_k={},
             max_seqlen_k={},
             attention_mask={},
@@ -636,7 +637,10 @@ class ContinuousBatchingAsyncIOs:
         # IO pairs used to avoid race conditions
         self.current_pair = 0
         self.io_pairs = [
-            HostDeviceIOPair(cache, config, device, model_dtype, max_graphs, return_logprobs, num_logits_processors_args) for _ in range(2)
+            HostDeviceIOPair(
+                cache, config, device, model_dtype, max_graphs, return_logprobs, num_logits_processors_args
+            )
+            for _ in range(2)
         ]
         # CUDA streams
         self.h2d_stream = torch.cuda.Stream(device=device)
@@ -664,7 +668,9 @@ class ContinuousBatchingAsyncIOs:
         max_kv_read: int,
     ) -> None:
         io_pair = self.io_pairs[self.current_pair]
-        io_pair.host_io.prepare_batch_tensors(requests_in_batch, logits_processors, use_decode_fast_path, num_q_tokens, max_kv_read)
+        io_pair.host_io.prepare_batch_tensors(
+            requests_in_batch, logits_processors, use_decode_fast_path, num_q_tokens, max_kv_read
+        )
         io_pair.host_io.carry_over_ids.copy_(self.infer_carry_over_ids())
 
     def infer_carry_over_ids(self) -> torch.Tensor:

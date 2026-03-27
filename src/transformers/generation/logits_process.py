@@ -450,6 +450,8 @@ class EncoderRepetitionPenaltyLogitsProcessor(LogitsProcessor):
     ```
     """
 
+    supports_continuous_batching: bool = False
+
     def __init__(self, penalty: float, encoder_input_ids: torch.LongTensor):
         if not isinstance(penalty, float) or not (penalty > 0):
             raise ValueError(f"`penalty` has to be a strictly positive float, but is {penalty}")

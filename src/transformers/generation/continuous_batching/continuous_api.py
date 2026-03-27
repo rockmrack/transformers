@@ -219,11 +219,23 @@ class ContinuousBatchProcessor:
             # Since in async there are 2 IO pairs, there are also 2 graph buffers: we divide the max_cached_graphs by 2
             max_cached_graphs = ceil(self.max_cached_graphs / 2)
             self.inputs_and_outputs = ContinuousBatchingAsyncIOs(
-                cache, config, model_device, model_dtype, max_cached_graphs, self.return_logprobs, self.logit_processor.tensors_required
+                cache=cache,
+                config=config,
+                device=model_device,
+                model_dtype=model_dtype,
+                max_graphs=max_cached_graphs,
+                return_logprobs=self.return_logprobs,
+                num_logits_processors_args=self.logit_processor.tensors_required,
             )
         else:
             self.inputs_and_outputs = ContinuousBatchingIOs(
-                cache, config, model_device, model_dtype, self.max_cached_graphs, self.return_logprobs, self.logit_processor.tensors_required
+                cache=cache,
+                config=config,
+                device=model_device,
+                model_dtype=model_dtype,
+                max_graphs=self.max_cached_graphs,
+                return_logprobs=self.return_logprobs,
+                num_logits_processors_args=self.logit_processor.tensors_required,
             )
         # Set up the graph pool. This allows all graphs to share the same memory pool, which is fine because they never
         # run concurrently. This greatly saves memory.
