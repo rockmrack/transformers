@@ -580,6 +580,7 @@ class TopKLogitsWarper(LogitsProcessor):
 
         self.top_k = max(top_k, min_tokens_to_keep)
         self.filter_value = filter_value
+        self.min_tokens_to_keep = min_tokens_to_keep  # used for CB processor initialization
 
     @add_start_docstrings(LOGITS_PROCESSOR_INPUTS_DOCSTRING)
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:

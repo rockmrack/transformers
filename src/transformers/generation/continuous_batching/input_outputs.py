@@ -93,7 +93,7 @@ class ContinuousBatchingIOs:
     batch alone.
     """
 
-    bulk_inputs: int = 7
+    static_inputs: int = 7  # Number of static inputs always present in the bulk tensor
 
     def __init__(
         self,
@@ -157,7 +157,7 @@ class ContinuousBatchingIOs:
 
         # Small inputs are allocated as slices in a larget tensor aligned to 128 bytes (32 * 4b). This reduces the
         # reduces fragmentation, so it lowers the number of D2H transfers and speeds up transfers.
-        bulk_lines = self.bulk_inputs + num_logits_processors_args
+        bulk_lines = self.static_inputs + num_logits_processors_args
         bulk_columns = aligned_divide(max_batch_tokens + 1, 1, 32)
         self._bulk_input_tensor = torch.empty(
             (bulk_lines, bulk_columns), dtype=torch.int32, device=self.device, pin_memory=pin_memory
@@ -262,8 +262,8 @@ class ContinuousBatchingIOs:
         kv_len = self.read_index_storage.size(-1) if full_reset else self.max_kv_read
 
         # Reset the attributes part of the bulk input tensor in one kernel
-        self._bulk_input_tensor[: self.bulk_inputs, : q_len + 1].zero_()
-        self._bulk_input_tensor[self.bulk_inputs :, : q_len + 1].fill_(1)  # better default value for logits processors
+        self._bulk_input_tensor[: self.static_inputs, : q_len + 1].zero_()
+        self._bulk_input_tensor[self.static_inputs :, : q_len + 1].fill_(1)  # best default value for logits processors
         self.max_seqlen_q = 0
 
         # Reset the logits indices and output ids
@@ -413,7 +413,7 @@ class ContinuousBatchingIOs:
         # Also prepare the tensor arguments for the logits processors
         logits_processors.prepare_tensor_args(
             requests_in_batch=requests_in_batch,
-            arg_storage=self._bulk_input_tensor[self.bulk_inputs :],
+            arg_storage=self._bulk_input_tensor[self.static_inputs :],
         )
 
         # When looping over request is done, we can build the actual tensors. This is faster than modifying the static
@@ -461,7 +461,7 @@ class ContinuousBatchingIOs:
             cu_seq_lens_q=self.cumulative_seqlens_q[: batch_size + 1],
             max_seqlen_q=self.max_seqlen_q,
             logits_indices=self.logits_indices[:q_size],
-            logits_processor_args=self._bulk_input_tensor[self.bulk_inputs :, :q_size],
+            logits_processor_args=self._bulk_input_tensor[self.static_inputs :, :q_size],
             cu_seq_lens_k={},
             max_seqlen_k={},
             attention_mask={},
