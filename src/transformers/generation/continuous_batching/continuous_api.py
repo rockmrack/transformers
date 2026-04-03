@@ -658,7 +658,9 @@ class ContinuousBatchProcessor:
             )
             try:
                 start = perf_counter()
-                self.inputs_and_outputs.prepare_batch_tensors(future_states, False, padded_q, padded_kv - padded_q)
+                self.inputs_and_outputs.prepare_batch_tensors(
+                    future_states, self.logit_processor, False, padded_q, padded_kv - padded_q
+                )
                 batch_data = self.inputs_and_outputs.get_model_kwargs(use_padding=True)
                 carry_over_ids, prev_output_ids, output_ids = self.inputs_and_outputs.get_cb_kwargs()
                 forward_fn = self._compiled_varlen or self._forward_process_and_sample
@@ -694,7 +696,9 @@ class ContinuousBatchProcessor:
                     continue
                 try:
                     padded_q = pad_to_interval(len(future_states), q_interval, self.max_batch_tokens)
-                    self.inputs_and_outputs.prepare_batch_tensors(future_states, True, padded_q, 0)
+                    self.inputs_and_outputs.prepare_batch_tensors(
+                        future_states, self.logit_processor, True, padded_q, 0
+                    )
                     batch_data = self.inputs_and_outputs.get_model_kwargs(use_padding=True)
                     carry_over_ids, prev_output_ids, output_ids = self.inputs_and_outputs.get_cb_kwargs()
                     forward_fn = self._compiled_decode or self._forward_process_and_sample

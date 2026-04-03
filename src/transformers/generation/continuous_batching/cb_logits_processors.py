@@ -26,7 +26,7 @@ from .requests import FutureRequestState, logger
 
 # Abstract base class for all continuous batching logits processors
 class ContinuousBatchingLogitsProcessor(ABC):
-    supported_kwargs: tuple[str, ...]  # Kwargs that this processor actively uses
+    supported_kwargs: dict[str, type]  # Kwargs that this processor actively uses, with expected type
     ignored_kwargs: tuple[str, ...]  # Kwargs that this processor recognizes but ignores
 
     @abstractmethod
@@ -88,7 +88,7 @@ class ContinuousBatchingLogitsProcessorList:
     def clear(self) -> None:
         self.logits_processor = LogitsProcessorList()
         self.tensors_required = 0
-        self.supported_keys = set()
+        self.supported_keys = {}
         self.ignored_keys = set()
 
     def _convert_to_per_request_processors(self) -> None:
@@ -131,8 +131,8 @@ class ContinuousBatchingLogitsProcessorList:
         return bool(self.logits_processor)
 
     def _retrieve_processors_kwargs(self) -> None:
-        """Retrieves the set of supported and ignored kwargs from continuous batching processors."""
-        self.supported_keys = set()
+        """Retrieves the supported (with types) and ignored kwargs from continuous batching processors."""
+        self.supported_keys: dict[str, type] = {}
         self.ignored_keys = set()
         for processor in self.logits_processor:
             if isinstance(processor, ContinuousBatchingLogitsProcessor):
@@ -143,8 +143,18 @@ class ContinuousBatchingLogitsProcessorList:
         """Checks that the provided kwargs are compatible with the current CB processors. Warn for ignored kwargs."""
         if not kwargs:
             return None
+        # Validate types for supported keys and detect unsupported keys
+        problematic_keys = set()
+        for key, value in kwargs.items():
+            if key not in self.supported_keys:
+                problematic_keys.add(key)
+            else:
+                expected_type = self.supported_keys[key]
+                if not isinstance(value, expected_type):
+                    raise TypeError(
+                        f"logit_processor_kwargs['{key}'] has type {type(value).__name__}, expected {expected_type.__name__}"
+                    )
         # Stop if there are only supported keys
-        problematic_keys = set(kwargs.keys()) - self.supported_keys
         if not problematic_keys:
             return None
         # Check if there are unknown keys
@@ -186,7 +196,7 @@ class ContinuousBatchingLogitsProcessorList:
 
 # Here are all the continuous batching logits processors that are supported
 class ContinuousBatchingTemperatureLogitsWarper(ContinuousBatchingLogitsProcessor):
-    supported_kwargs: tuple[str, ...] = ("temperature",)
+    supported_kwargs: dict[str, type] = {"temperature": float}
     ignored_kwargs: tuple[str, ...] = ()
 
     def __init__(self, temperature_processor: TemperatureLogitsWarper) -> None:
@@ -208,7 +218,7 @@ class ContinuousBatchingTemperatureLogitsWarper(ContinuousBatchingLogitsProcesso
 
 
 class ContinuousBatchingTopKLogitsWarper(ContinuousBatchingLogitsProcessor):
-    supported_kwargs: tuple[str, ...] = ("top_k",)
+    supported_kwargs: dict[str, type] = {"top_k": int}
     ignored_kwargs: tuple[str, ...] = ("filter_value", "min_tokens_to_keep")
 
     def __init__(self, top_k_processor: TopKLogitsWarper):
@@ -241,7 +251,7 @@ class ContinuousBatchingTopKLogitsWarper(ContinuousBatchingLogitsProcessor):
 
 
 class ContinuousBatchingTopPLogitsWarper(ContinuousBatchingLogitsProcessor):
-    supported_kwargs: tuple[str, ...] = ("top_p",)
+    supported_kwargs: dict[str, type] = {"top_p": float}
     ignored_kwargs: tuple[str, ...] = ("filter_value", "min_tokens_to_keep")
 
     def __init__(self, top_p_processor: TopPLogitsWarper):

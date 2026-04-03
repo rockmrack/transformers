@@ -867,7 +867,7 @@ class ContinuousBatchingWithAcceleratorTest(unittest.TestCase):
 
         tokenizer, model = get_tokenizer_and_model(model_id, "sdpa", torch_device)
         manager = model.init_continuous_batching()
-        manager.logit_processor = LogitsProcessorList()
+        manager.logit_processor.clear()
         manager.start()
 
         user_messages = ["What is the Transformers library known for?"]
